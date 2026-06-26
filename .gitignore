@@ -1,0 +1,5 @@
+# build output - distributed via GitHub Releases, not committed
+*.exe
+# runtime / local
+GP3TyreInjector.cfg
+*.bak
