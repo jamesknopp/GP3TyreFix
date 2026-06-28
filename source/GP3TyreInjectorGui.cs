@@ -10,12 +10,12 @@ using System.Threading;
 using System.Reflection;
 
 [assembly: AssemblyTitle("GP3 Tyre Fix Injector")]
-[assembly: AssemblyDescription("Runtime in-memory fix for GP3 non-power-of-two tyre textures plus force-3D-wheels-in-all-views. Supports GP3 v1.13 and GP3 2000. The on-disk game exe is never modified.")]
+[assembly: AssemblyDescription("Runtime in-memory fix for GP3 non-power-of-two tyre textures plus force-3D-wheels-in-all-views, and crowd sprites at distance (no flat painted grandstands). Supports GP3 v1.13 and GP3 2000. The on-disk game exe is never modified.")]
 [assembly: AssemblyCompany("James Knopp")]
 [assembly: AssemblyProduct("GP3 Tyre Fix Injector")]
 [assembly: AssemblyCopyright("Copyright © James Knopp 2026")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
 
 // GP3 Tyre Fix Injector - Windows GUI (multi-build, runtime/in-memory).
 //  Pick version -> locate the DECRYPTED exe -> validate (PE + all 5 signatures + build match)
@@ -49,6 +49,26 @@ class GP3TyreInjectorGui
         new Site{ Name="3D wheels", Pre=new[]{0x80,0xBA,-1,-1,-1,-1,0x01}, OrigJump=new[]{0x0F,0x8C,-1,-1,-1,-1}, PatchJump=new byte[]{0x90,0x90,0x90,0x90,0x90,0x90},
                   Post=new[]{0xE8} },
     };
+    // ---------- crowd sprites at distance (CODE patch, build-independent) ----------
+    // GP3 draws grandstand crowds as a flat painted backdrop beyond a depth threshold and as
+    // vertical people-sprites within it. The crowd builder compares each section's projected depth
+    // against gCrowdCardDepthThreshold (v1.13 VA 0x809910, 2000 VA 0xB85714, both =0x30000):
+    //   depth >= threshold -> flat ; < -> sprite rows.
+    // We DON'T write the data global: in GP3 2000 it is written at RUNTIME (mov [0xB85714],eax @0x44A3BB)
+    // so a data write gets clobbered. Instead we rewrite the FOUR `cmp reg,[threshold]` (3B /r disp32,
+    // 6 bytes) to `cmp reg, imm32` (81 /7 imm32, 6 bytes) = use our value directly, ignore the global
+    // and its writer. The block is byte-identical across builds (only the addresses move):
+    //   3B0D<va> 7D4C E8<rel> 3B1D<va> 7C33 C605<va>FF  EB1C  3B05<va> 7D2E E8<rel> 3B15<va> 7C
+    static readonly int[] CrowdSig = new[]{
+        0x3B,0x0D,-1,-1,-1,-1, 0x7D,0x4C, 0xE8,-1,-1,-1,-1,
+        0x3B,0x1D,-1,-1,-1,-1, 0x7C,0x33, 0xC6,0x05,-1,-1,-1,-1,0xFF,
+        0xEB,0x1C, 0x3B,0x05,-1,-1,-1,-1, 0x7D,0x2E, 0xE8,-1,-1,-1,-1,
+        0x3B,0x15,-1,-1,-1,-1, 0x7C };
+    static readonly int[]  CrowdCmpOff   = { 0x00, 0x0D, 0x1E, 0x2B };  // the 4 `cmp reg,[thresh]` within the block
+    static readonly byte[] CrowdCmpModrm = { 0xF9, 0xFB, 0xF8, 0xFA };  // -> cmp ecx/ebx/eax/edx, imm32 (81 /7)
+    const uint CROWD_STOCK = 0x00030000;        // GP3 stock crowd depth threshold (= 1x; sprites only up close)
+    const int  CROWD_MULT_MIN=1, CROWD_MULT_MAX=64, CROWD_MULT_DEFAULT=5;   // user picks an x-normal multiplier; imm = stock * mult
+
     static int[] Concat(params int[][] ps){ var l=new List<int>(); foreach(var p in ps) l.AddRange(p); return l.ToArray(); }
     static int[] AsInts(byte[] b){ var r=new int[b.Length]; for(int i=0;i<b.Length;i++) r[i]=b[i]; return r; }
     static List<int> FindAll(byte[] hay,int[] pat){ var h=new List<int>(); int m=pat.Length;
@@ -84,12 +104,14 @@ class GP3TyreInjectorGui
     class MainForm : Form
     {
         RadioButton rbV113, rb2000; TextBox txtExe, txtGpx, txtLog; Button bExe, bGpx, bGo; Label lblStat;
+        CheckBox chkTyre, chk3D, chkCrowd; NumericUpDown numCrowd; Button bStock;
         readonly string cfg = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "GP3TyreInjector.cfg");
         volatile bool running; Thread worker; readonly HashSet<int> done = new HashSet<int>();
+        volatile bool optTyre=true, opt3D=true, optCrowd=true; volatile uint crowdVal=CROWD_STOCK*(uint)CROWD_MULT_DEFAULT;
 
         public MainForm(){
             Text="GP3 tyre fix injector"; FormBorderStyle=FormBorderStyle.FixedSingle; MaximizeBox=false; StartPosition=FormStartPosition.CenterScreen;
-            ClientSize=new Size(486,452); Font=new Font("Segoe UI",9f);
+            ClientSize=new Size(486,516); Font=new Font("Segoe UI",9f);
             try { this.Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch {}
 
             Add(new Label{ Text="Game version", AutoSize=true, Location=new Point(14,12), ForeColor=SystemColors.GrayText });
@@ -106,14 +128,27 @@ class GP3TyreInjectorGui
             txtGpx=new TextBox{ Location=new Point(14,162), Size=new Size(360,24) }; Add(txtGpx);
             bGpx=new Button{ Text="Browse…", Location=new Point(382,161), Size=new Size(86,26) }; bGpx.Click+=(s,e)=>Pick(txtGpx); Add(bGpx);
 
-            bGo=new Button{ Text="Launch & inject", Location=new Point(14,198), Size=new Size(454,34), Font=new Font("Segoe UI",10f,FontStyle.Bold) };
+            // ---- options: which patches to apply ----
+            Add(new Label{ Text="Apply", AutoSize=true, Location=new Point(14,190), ForeColor=SystemColors.GrayText });
+            chkTyre =new CheckBox{ Text="Tyre texture fix (power-of-two)", Location=new Point(14,210), AutoSize=true, Checked=true };
+            chk3D   =new CheckBox{ Text="3D tyres / wheels in all camera views", Location=new Point(14,232), AutoSize=true, Checked=true };
+            chkCrowd=new CheckBox{ Text="Crowd sprites at distance", Location=new Point(14,255), AutoSize=true, Checked=true };
+            Add(chkTyre); Add(chk3D); Add(chkCrowd);
+            numCrowd=new NumericUpDown{ Location=new Point(200,252), Size=new Size(56,24), Minimum=CROWD_MULT_MIN, Maximum=CROWD_MULT_MAX, Value=CROWD_MULT_DEFAULT };
+            Add(new Label{ Text="× normal", AutoSize=true, Location=new Point(262,257), ForeColor=SystemColors.GrayText });
+            bStock=new Button{ Text="Stock", Location=new Point(372,251), Size=new Size(64,26) };
+            bStock.Click+=(s,e)=>{ numCrowd.Value=1; };
+            chkCrowd.CheckedChanged+=(s,e)=>{ numCrowd.Enabled=bStock.Enabled=chkCrowd.Checked; };
+            Add(numCrowd); Add(bStock);
+
+            bGo=new Button{ Text="Launch & inject", Location=new Point(14,290), Size=new Size(454,34), Font=new Font("Segoe UI",10f,FontStyle.Bold) };
             bGo.Click+=(s,e)=>Toggle(); Add(bGo);
 
-            txtLog=new TextBox{ Location=new Point(14,244), Size=new Size(454,166), Multiline=true, ReadOnly=true, ScrollBars=ScrollBars.Vertical, BackColor=Color.FromArgb(30,30,30), ForeColor=Color.Gainsboro, Font=new Font("Consolas",9f) };
+            txtLog=new TextBox{ Location=new Point(14,334), Size=new Size(454,140), Multiline=true, ReadOnly=true, ScrollBars=ScrollBars.Vertical, BackColor=Color.FromArgb(30,30,30), ForeColor=Color.Gainsboro, Font=new Font("Consolas",9f) };
             Add(txtLog);
 
-            Add(new Label{ AutoSize=true, Location=new Point(14,418), ForeColor=SystemColors.GrayText, Text="v"+AsmVer()+"   ·   "+AttrCopyright() });
-            var lnkAbout=new LinkLabel{ AutoSize=true, Text="About", Location=new Point(433,418) };
+            Add(new Label{ AutoSize=true, Location=new Point(14,482), ForeColor=SystemColors.GrayText, Text="v"+AsmVer()+"   ·   "+AttrCopyright() });
+            var lnkAbout=new LinkLabel{ AutoSize=true, Text="About", Location=new Point(433,482) };
             lnkAbout.Click+=(s,e)=>ShowAbout(); Add(lnkAbout);
 
             LoadCfg(); Recheck();
@@ -149,6 +184,8 @@ class GP3TyreInjectorGui
             string gpx=txtGpx.Text.Trim().Trim('"');
             if(!validOk){ Recheck(); if(!validOk) return; }
             if(!File.Exists(gpx)){ MessageBox.Show(this,"GPxPatch.exe not found.","GP3 tyre fix injector"); return; }
+            optTyre=chkTyre.Checked; opt3D=chk3D.Checked; optCrowd=chkCrowd.Checked; crowdVal=CROWD_STOCK*(uint)numCrowd.Value;
+            if(!optTyre && !opt3D && !optCrowd){ MessageBox.Show(this,"Select at least one patch to apply.","GP3 fix injector"); return; }
             SaveCfg();
             try{ Process.Start(new ProcessStartInfo{ FileName=gpx, WorkingDirectory=Path.GetDirectoryName(gpx), UseShellExecute=true }); }
             catch(Exception ex){ MessageBox.Show(this,"Could not launch GPxPatch:\n"+ex.Message,"GP3 tyre fix injector"); return; }
@@ -156,7 +193,8 @@ class GP3TyreInjectorGui
             done.Clear(); running=true; bGo.Text="Stop watching"; SetControls(false);
             worker=new Thread(Watch){ IsBackground=true }; worker.Start();
         }
-        void SetControls(bool on){ rbV113.Enabled=rb2000.Enabled=txtExe.Enabled=txtGpx.Enabled=bExe.Enabled=bGpx.Enabled=on; }
+        void SetControls(bool on){ rbV113.Enabled=rb2000.Enabled=txtExe.Enabled=txtGpx.Enabled=bExe.Enabled=bGpx.Enabled=chkTyre.Enabled=chk3D.Enabled=chkCrowd.Enabled=on;
+            numCrowd.Enabled=bStock.Enabled = on && chkCrowd.Checked; }
 
         void Watch(){
             while(running){
@@ -186,12 +224,35 @@ class GP3TyreInjectorGui
                 byte[] code=new byte[tSz];
                 if(!(ReadProcessMemory(h,(IntPtr)(IMAGE_BASE+tVA),code,(IntPtr)code.Length,out n) && (int)n==code.Length)) return;
                 int applied=0, already=0, missing=0;
-                foreach(var s in Sites){ int st; int c=Classify(code,s,out st);
+                for(int i=0;i<Sites.Length;i++){
+                    bool want = (i<4) ? optTyre : opt3D;       // sites 0-3 = tyre texture fix, site 4 = 3D wheels
+                    if(!want) continue;
+                    var s=Sites[i]; int st; int c=Classify(code,s,out st);
                     if(c==0){ uint va=IMAGE_BASE+tVA+(uint)(st+s.Pre.Length); IntPtr w;
                         if(WriteProcessMemory(h,(IntPtr)va,s.PatchJump,(IntPtr)s.PatchJump.Length,out w)&&(int)w==s.PatchJump.Length){ FlushInstructionCache(h,(IntPtr)va,(IntPtr)s.PatchJump.Length); applied++; } else missing++; }
-                    else if(c==1) already++; else missing++; }
-                if(applied==0&&already==0){ Log("GP3 pid "+pr.Id+": no patch sites matched — unsupported build, skipped."); done.Add(pr.Id); return; }
-                Log(BuildName(WheelDisp(code))+" pid "+pr.Id+": applied "+applied+", already-ok "+already+(missing>0?(", missing "+missing):"")+".");
+                    else if(c==1) already++; else missing++;
+                }
+                // crowd sprites at distance: rewrite the 4 `cmp reg,[thresh]` -> `cmp reg, imm32` (build-independent; survives 2000's runtime writer)
+                string crowd="";
+                if(optCrowd){
+                    var ch=FindAll(code,CrowdSig);
+                    if(ch.Count>=1){ int blk=ch[0]; byte[] imm=BitConverter.GetBytes(crowdVal); int cw=0,calr=0,cmiss=0;
+                        for(int k=0;k<CrowdCmpOff.Length;k++){
+                            uint va=IMAGE_BASE+tVA+(uint)(blk+CrowdCmpOff[k]);
+                            byte[] cur6=new byte[6]; IntPtr rnc;
+                            if(!(ReadProcessMemory(h,(IntPtr)va,cur6,(IntPtr)6,out rnc)&&(int)rnc==6)){ cmiss++; continue; }
+                            if(cur6[0]==0x81 && cur6[1]==CrowdCmpModrm[k]){ calr++; continue; }   // already an imm cmp
+                            if(cur6[0]!=0x3B){ cmiss++; continue; }                                // not the expected cmp r,[mem]
+                            byte[] p=new byte[6]{0x81,CrowdCmpModrm[k],imm[0],imm[1],imm[2],imm[3]}; IntPtr w3;
+                            if(WriteProcessMemory(h,(IntPtr)va,p,(IntPtr)6,out w3)&&(int)w3==6){ FlushInstructionCache(h,(IntPtr)va,(IntPtr)6); cw++; } else cmiss++;
+                        }
+                        crowd = cw>0 ? (", crowd 0x"+crowdVal.ToString("X")+" applied") : (calr==CrowdCmpOff.Length ? ", crowd already-ok" : ", crowd failed");
+                    }
+                    else crowd=", crowd site missing";
+                }
+                bool did = applied>0 || already>0 || crowd.Contains("applied") || crowd.Contains("already");
+                if(!did){ Log("GP3 pid "+pr.Id+": "+((optTyre||opt3D||optCrowd)?"no patch sites matched — unsupported build, skipped.":"nothing selected.")); done.Add(pr.Id); return; }
+                Log(BuildName(WheelDisp(code))+" pid "+pr.Id+": applied "+applied+", already-ok "+already+(missing>0?(", missing "+missing):"")+crowd+".");
                 done.Add(pr.Id);
             }
             finally{ CloseHandle(h); }
@@ -203,8 +264,12 @@ class GP3TyreInjectorGui
         void LoadCfg(){ try{ if(!File.Exists(cfg)) { SuggestDefaults(); return; }
             foreach(var ln in File.ReadAllLines(cfg)){ int i=ln.IndexOf('='); if(i<1) continue; string k=ln.Substring(0,i).Trim(), val=ln.Substring(i+1).Trim();
                 if(k=="version"){ if(val=="v113") { rbV113.Checked=true; } else { rb2000.Checked=true; } }
-                else if(k=="exe") txtExe.Text=val; else if(k=="gpx") txtGpx.Text=val; }
-            if(txtGpx.Text.Length==0) SuggestGpx(); }catch{ SuggestDefaults(); } }
+                else if(k=="exe") txtExe.Text=val; else if(k=="gpx") txtGpx.Text=val;
+                else if(k=="tyre") chkTyre.Checked=(val!="0"); else if(k=="wheels") chk3D.Checked=(val!="0");
+                else if(k=="crowd") chkCrowd.Checked=(val!="0");
+                else if(k=="crowdval"){ int mv; if(int.TryParse(val,out mv)){ if(mv<CROWD_MULT_MIN) mv=CROWD_MULT_MIN; if(mv>CROWD_MULT_MAX) mv=CROWD_MULT_MAX; numCrowd.Value=mv; } } }
+            if(txtGpx.Text.Length==0) SuggestGpx();
+            numCrowd.Enabled=bStock.Enabled=chkCrowd.Checked; }catch{ SuggestDefaults(); } }
         void SuggestDefaults(){ if(rbV113.Checked && File.Exists(@"D:\gp3\GP3.exe")) txtExe.Text=@"D:\gp3\GP3.exe";
             else if(File.Exists(@"D:\gp32k\gp3_2000.exe")) txtExe.Text=@"D:\gp32k\gp3_2000.exe"; SuggestGpx(); }
         void SuggestGpx(){ foreach(var g in new[]{ Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"GPxPatch.exe"), @"D:\gp3\GPxPatch.exe" }) if(File.Exists(g)){ txtGpx.Text=g; break; } }
@@ -222,6 +287,7 @@ class GP3TyreInjectorGui
                 f.Controls.Add(ok); f.AcceptButton=ok; f.CancelButton=ok; f.ShowDialog(this);
             }
         }
-        void SaveCfg(){ try{ File.WriteAllText(cfg, "version="+(selV113?"v113":"2000")+"\r\nexe="+txtExe.Text.Trim()+"\r\ngpx="+txtGpx.Text.Trim()+"\r\n"); }catch{} }
+        void SaveCfg(){ try{ File.WriteAllText(cfg, "version="+(selV113?"v113":"2000")+"\r\nexe="+txtExe.Text.Trim()+"\r\ngpx="+txtGpx.Text.Trim()
+            +"\r\ntyre="+(chkTyre.Checked?"1":"0")+"\r\nwheels="+(chk3D.Checked?"1":"0")+"\r\ncrowd="+(chkCrowd.Checked?"1":"0")+"\r\ncrowdval="+((int)numCrowd.Value)+"\r\n"); }catch{} }
     }
 }

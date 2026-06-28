@@ -1,8 +1,9 @@
 # GP3 Tyre Fix
 
 Fixes the broken tyre/wheel rendering in **Grand Prix 3** and **GP3 2000** on the
-hardware renderer, and optionally forces the 3D wheel model
-in every camera view.
+hardware renderer, forces the 3D wheel model in every camera view, and puts the
+crowd sprites on the grandstands at all distances (instead of the flat painted
+crowd GP3 fades to in the distance).
 
 Copyright © James Knopp 2026.
 
@@ -41,8 +42,13 @@ you're using.
 4. **Browse** to your decrypted game exe. You should get a green
    *"Decrypted … verified — all 5 patch sites found."*
 5. Confirm the **GPxPatch** path (auto-filled if found).
-6. Click **Launch & inject**. Start the game as normal; the log shows
-   *"applied 5"* once GP3 loads.
+6. Under **Apply**, tick what you want (all on by default): **Tyre texture fix**,
+   **3D tyres / wheels in all camera views**, and **Crowd sprites at distance**.
+   The crowd distance is a simple **× normal** multiplier (default **5×**, up to
+   64×) — higher draws the grandstand sprites farther out; **Stock** resets it to
+   **1×** (GP3 normal).
+7. Click **Launch & inject**. Start the game as normal; the log shows what was
+   applied once GP3 loads.
 
 Your choices are saved, so next time just open it and click Launch & inject.
 
@@ -88,10 +94,11 @@ down to taste and your GPU; only the VRAM note is fix-related.
 
 ## What it actually changes
 
-Five one-byte-style edit that make GP3 round textures to power-of-two and
-(optionally) always use the 3D wheel model. The injector applies them to the
-running process only; the patcher applies them to the file (with a backup). Full
-addresses, signatures and the mechanism are in **`GP3_TyreFix_PatchSpec.md`**.
+Five one-byte-style edits that make GP3 round textures to power-of-two and always
+use the 3D wheel model, plus a small rewrite of the crowd depth-compares that
+raises the cards-appear distance so the grandstand sprites draw farther out. The
+injector applies them to the running process only. Full addresses, signatures and
+the mechanism are in **`GP3_TyreFix_PatchSpec.md`**.
 
 The on-disk game exe is never modified by the injector — so GPxPatch and dgVoodoo
 behave exactly as before.

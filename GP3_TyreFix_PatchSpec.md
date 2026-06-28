@@ -116,3 +116,34 @@ for (int i = 0; i < 5; i++) {
 ```
 (Signature-search variant: scan the module image for each unique signature and patch the
 `[jump]` bytes within it — more robust than raw VAs.)
+
+## Crowd sprites at distance (compare patch)
+
+GP3 draws grandstand crowds two ways and switches per section by depth: **vertical
+people-sprites** ("cards", clines JamID 0x3C0) within a threshold, and a **flat painted
+backdrop** (farcrwd JamID 0x343) beyond it. The threshold is the dword
+`gCrowdCardDepthThreshold` (v1.13 VA `0x809910`, GP3 2000 VA `0xB85714`, both `0x00030000`),
+compared in the crowd builder (v1.13 `sub_44F31C` @0x44F378, 2000 @0x47034E) against each
+section's projected camera-space depth (`[vtx+8]`): depth ≥ threshold → flat, < → sprites.
+**Raising the effective threshold pushes the sprites out to all visible distances**, with no
+distortion (sections still get real card geometry).
+
+**Patch the COMPARE, not the data.** On **v1.13** `0x809910` is a static constant (no writers),
+so a data write would work — **but on GP3 2000 the global is written at runtime**
+(`mov [0xB85714], eax` @0x44A3BB), so a data write is clobbered immediately. The build-robust
+fix is to rewrite the **four `cmp reg,[threshold]`** instructions to `cmp reg, imm32` — same
+length, uses our value directly, ignores the global and its writer. The block is byte-identical
+across builds (only the addresses differ); the four compares are `ecx/ebx/eax/edx` at block
+offsets `+0x00/+0x0D/+0x1E/+0x2B`:
+
+```
+block sig (50 bytes, matches v1.13 0x44F378 + 2000 0x47034E once each):
+  3B0D<va> 7D4C E8<rel> 3B1D<va> 7C33 C605<va>FF  EB1C  3B05<va> 7D2E E8<rel> 3B15<va> 7C
+each cmp:  3B <0D|1D|05|15> <disp32>   ->   81 <F9|FB|F8|FA> <imm32>   (cmp ecx|ebx|eax|edx, imm32)
+imm32 = 0x30000 × mult   (injector "× normal" multiplier, default 5×, range 1–64×; 1× = stock)
+```
+
+These are **code** bytes ⇒ `FlushInstructionCache` after writing. **Open:** beyond the
+16-vert→12-vert geometry-LOD cutoff (a separate upstream distance) sections have no card
+geometry, so the far horizon can still go flat — raising this covers the full card range but
+not past that wall.
